@@ -1,0 +1,150 @@
+name: check-and-release
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Override diesel_cli version (optional)'
+        required: false
+        type: string
+      force:
+        description: 'Force release even if the tag already exists'
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches:
+      - 'dev'
+
+
+permissions:
+  contents: write
+
+concurrency:
+  group: diesel-cli-release
+  cancel-in-progress: false
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      should_release: ${{ steps.resolve.outputs.should_release }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve target version
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${{ inputs.version || '' }}" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="$(curl -fsSL -A 'Khoyo/diesel_cli_bin' https://crates.io/api/v1/crates/diesel_cli | jq -r '.crate.newest_version')"
+          fi
+
+          TAG="diesel-cli-v${VERSION}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "${TAG}"; then
+            if [[ "${{ inputs.force || 'false' }}" == "true" ]]; then
+              echo "Tag ${TAG} already exists but force is enabled"
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Tag ${TAG} already exists"
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Print decision
+        run: |
+          echo "version=${{ steps.resolve.outputs.version }}"
+          echo "tag=${{ steps.resolve.outputs.tag }}"
+          echo "should_release=${{ steps.resolve.outputs.should_release }}"
+
+  build:
+    needs: resolve-version
+    if: needs.resolve-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:latest
+
+    steps:
+      - name: Install dependencies
+        run: |
+          apk add --no-cache \
+            build-base \
+            curl \
+            git \
+            openssl-dev \
+            libpq-dev \
+            pkgconfig \
+            tar
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+          . "$HOME/.cargo/env"
+
+      - name: Build diesel_cli
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          set -eu
+          . "$HOME/.cargo/env"
+          RUSTFLAGS="-C target-feature=-crt-static" cargo install \
+            diesel_cli \
+            --version "$VERSION" \
+            --root /tmp/install \
+            --no-default-features \
+            --features postgres \
+            --locked
+
+      - name: Package
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          set -eu
+          mkdir dist
+          cp /tmp/install/bin/diesel dist/
+          tar -C dist -czf diesel_cli-${VERSION}-x86_64-unknown-linux-musl.tar.gz diesel
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        with:
+          name: diesel_cli-${{ env.VERSION }}-x86_64-unknown-linux-musl
+          path: diesel_cli-${{ env.VERSION }}-x86_64-unknown-linux-musl.tar.gz
+
+
+  release:
+    needs: [resolve-version, build]
+    if: needs.resolve-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve-version.outputs.tag }}
+          name: ${{ needs.resolve-version.outputs.tag }}
+          generate_release_notes: true
+          files: release-assets/*
