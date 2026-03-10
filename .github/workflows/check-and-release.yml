@@ -46,7 +46,7 @@ jobs:
           if [[ -n "${{ inputs.version || '' }}" ]]; then
             VERSION="${{ inputs.version }}"
           else
-            VERSION="$(curl -fsSL -A 'Khoyo/diesel_cli_bin' https://crates.io/api/v1/crates/diesel_cli | jq -r '.crate.newest_version')"
+            VERSION="$(curl -fsSL -A 'osrd-project/diesel_cli_bin' https://crates.io/api/v1/crates/diesel_cli | jq -r '.crate.newest_version')"
           fi
 
           TAG="diesel-cli-v${VERSION}"
